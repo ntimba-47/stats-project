@@ -1,0 +1,14 @@
+project:
+  type: website
+
+website:
+  title: "UFC Regression Analysis"
+  navbar:
+    left:
+      - href: ufc_regression.qmd
+        text: Analysis
+
+format:
+  html:
+    theme: cosmo
+    embed-resources: true
