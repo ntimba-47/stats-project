@@ -1,0 +1,298 @@
+---
+title: "UFC Career Win Percentage: Regression Analysis"
+author: "Leo Johnson, Ndapuwa Timba, Colin Moore, Matthew Schuenemann"
+format:
+  html:
+    embed-resources: true
+---
+
+## Setup
+
+We use base R for most of the analysis, `MASS` for backward stepwise selection (`stepAIC`),
+`ggplot2` for the figures that go in the paper, and `knitr` for the table.
+
+```{r}
+#| message: false
+library(MASS)
+library(ggplot2)
+library(knitr)
+```
+
+## Data cleaning
+
+These are the same cleaning steps from Project Update 4, plus two new ones:
+(1) we drop athletes with fewer than 5 professional bouts, and (2) we group the
+weight classes into four division groups.
+
+```{r}
+# read in the data (change the file name here if yours is saved differently)
+ufc <- read.csv("ufc_athletes.csv")
+nrow(ufc)   # 3,145 athletes
+
+# heights and weights of zero are impossible, so treat them as missing
+ufc$height[!is.na(ufc$height) & ufc$height <= 0] <- NA
+ufc$weight[!is.na(ufc$weight) & ufc$weight <= 0] <- NA
+
+# total professional bouts and the response variable (career win percentage, 0-100)
+ufc$total_fights <- ufc$wins + ufc$losses + ufc$draws
+ufc <- subset(ufc, total_fights > 0 & !is.na(weight_class))
+ufc$win_pct <- 100 * ufc$wins / ufc$total_fights
+nrow(ufc)   # 2,803 athletes
+
+# put the two defense rates on a 0-100 percent scale so coefficients are per percentage point
+ufc$sig_str_defense <- 100 * ufc$sig_str_defense
+ufc$takedown_defense <- 100 * ufc$takedown_defense
+
+# keep only the variables we model, and only athletes with no missing values
+model_vars <- c("win_pct", "weight_class", "age", "height", "reach", "sig_str_landed",
+                "sig_str_absorbed", "sig_str_defense", "takedown_avg", "takedown_defense",
+                "submission_avg", "knockdown_avg", "total_fights")
+ufc <- na.omit(ufc[, model_vars])
+nrow(ufc)   # 1,789 athletes
+
+# NEW: win percentages based on only 1-4 bouts are very noisy (e.g. 1-0 = 100%), so drop them
+ufc <- subset(ufc, total_fights >= 5)
+nrow(ufc)   # 1,746 athletes
+
+# NEW: group the 12 weight classes into 4 division groups so each group has enough athletes
+# to estimate its own slopes (Women's Featherweight alone only had a handful of athletes)
+ufc$division <- "Men Heavier"
+ufc$division[ufc$weight_class %in% c("Flyweight", "Bantamweight", "Featherweight")] <- "Men Lighter"
+ufc$division[ufc$weight_class %in% c("Lightweight", "Welterweight", "Middleweight")] <- "Men Middle"
+ufc$division[grepl("Women", ufc$weight_class)] <- "Women"
+ufc$division <- factor(ufc$division, levels = c("Men Middle", "Men Lighter", "Men Heavier", "Women"))
+table(ufc$division)
+```
+
+## Training and test split
+
+75% of athletes go in the training set and 25% go in the test set. The test set is not
+touched again until the very end.
+
+The training set is then split in half again. Following Lab 8, one half is only used to pick
+the variables (stepwise selection) and the other half is only used for inference (tests,
+confidence intervals, and diagnostics), so the same data is never used for both.
+
+```{r}
+set.seed(123)
+train.rows <- sample(1:nrow(ufc), size = round(0.75 * nrow(ufc)))
+train <- ufc[train.rows, ]
+test <- ufc[-train.rows, ]
+
+select.rows <- sample(1:nrow(train), size = round(0.5 * nrow(train)))
+select.data <- train[select.rows, ]    # used for variable selection
+infer.data <- train[-select.rows, ]    # used for inference and diagnostics
+
+c(train = nrow(train), test = nrow(test), selection = nrow(select.data), inference = nrow(infer.data))
+```
+
+## Exploratory data analysis (training set only)
+
+```{r}
+# distribution of the response
+summary(train$win_pct)
+sd(train$win_pct)
+hist(train$win_pct, breaks = 30, main = "Career Win Percentage (Training Set)",
+     xlab = "Career win percentage")
+
+# average win percentage by division group
+round(tapply(train$win_pct, train$division, mean), 1)
+
+# correlation of each numeric predictor with win percentage
+num_vars <- c("age", "height", "reach", "sig_str_landed", "sig_str_absorbed", "sig_str_defense",
+              "takedown_avg", "takedown_defense", "submission_avg", "knockdown_avg", "total_fights")
+round(sort(cor(train[, num_vars], train$win_pct)[, 1]), 3)
+
+# height and reach are strongly related, so check for multicollinearity
+cor(train$height, train$reach)
+```
+
+Win percentage by age looked curved (it drops quickly for younger athletes and then levels
+off), so we checked a quadratic term for age.
+
+```{r}
+# average win percentage in age bands
+round(tapply(train$win_pct, cut(train$age, c(19, 27, 31, 35, 39, 45, 60)), mean), 1)
+
+# compare a straight-line fit to a quadratic fit for age
+age.linear <- lm(win_pct ~ age, data = train)
+age.quad <- lm(win_pct ~ age + I(age^2), data = train)
+summary(age.quad)$coefficients
+```
+
+```{r}
+#| fig-cap: "Figure 1. Career win percentage by age in the training set, with the fitted quadratic curve."
+fig1 <- ggplot(train, aes(x = age, y = win_pct)) +
+  geom_point(alpha = 0.3) +
+  geom_smooth(method = "lm", formula = y ~ x + I(x^2), se = FALSE, color = "red") +
+  labs(x = "Age (Years)", y = "Career Win Percentage") +
+  theme_bw()
+fig1
+ggsave("figure1_age.pdf", fig1, width = 6, height = 4)   # saved for the paper
+```
+
+```{r}
+# variance inflation factors (VIF = 1 / (1 - R^2) from regressing each predictor on the others)
+vif <- c()
+for (v in num_vars) {
+  other <- setdiff(num_vars, v)
+  r2 <- summary(lm(as.formula(paste(v, "~", paste(other, collapse = " + "))), data = select.data))$r.squared
+  vif[v] <- 1 / (1 - r2)
+}
+round(vif, 2)   # none above 10, so all predictors stay in as candidates
+```
+
+## Model fitting and variable selection (selection half)
+
+The full model has every candidate predictor. Age (with its quadratic term) and total bouts
+are included as controls. Because our research question asks whether attributes matter
+equally across weight classes, every physical attribute and fighting tendency is also
+allowed to interact with division group.
+
+```{r}
+full.model <- lm(win_pct ~ age + I(age^2) + total_fights +
+                   (height + reach + sig_str_landed + sig_str_absorbed + sig_str_defense +
+                      takedown_avg + takedown_defense + submission_avg + knockdown_avg) * division,
+                 data = select.data)
+length(coef(full.model))   # number of estimated parameters
+AIC(full.model)
+
+# backward stepwise selection based on AIC
+step.model <- stepAIC(full.model, direction = "backward", trace = 0)
+formula(step.model)
+AIC(step.model)
+```
+
+## Testing the weight-class interactions (inference half)
+
+Stepwise selection kept three interactions with division group. We test whether they are
+needed using a nested F-test on the inference half, which was not used for selection.
+
+```{r}
+# selected model (with the interactions) refit on the inference half
+selected.model <- lm(formula(step.model), data = infer.data)
+
+# same model without the interaction terms
+main.model <- lm(win_pct ~ age + I(age^2) + total_fights + reach + sig_str_landed +
+                   sig_str_absorbed + takedown_avg + takedown_defense + submission_avg +
+                   knockdown_avg + division, data = infer.data)
+
+# nested F-test: H0 = all interaction slopes are 0
+anova(main.model, selected.model)
+```
+
+The interactions were not significant, so the final model is the main-effects model.
+
+## Final model (inference half)
+
+```{r}
+final.model <- main.model
+summary(final.model)
+confint(final.model)
+
+# age where the fitted quadratic bottoms out
+-coef(final.model)["age"] / (2 * coef(final.model)["I(age^2)"])
+```
+
+```{r}
+# table of estimates with readable names
+est <- summary(final.model)$coefficients
+nice_names <- c("Intercept", "Age (years)", "Age squared", "Total professional bouts",
+                "Reach (inches)", "Significant strikes landed per minute",
+                "Significant strikes absorbed per minute", "Takedowns landed per 15 minutes",
+                "Takedown defense (%)", "Submission attempts per 15 minutes",
+                "Knockdowns landed per 15 minutes", "Division: men's lighter",
+                "Division: men's heavier", "Division: women's")
+results.table <- data.frame(Term = nice_names,
+                            Estimate = round(est[, 1], 3),
+                            SE = round(est[, 2], 3),
+                            t = round(est[, 3], 2),
+                            p = ifelse(est[, 4] < 0.001, "< 0.001", round(est[, 4], 3)))
+kable(results.table, row.names = FALSE,
+      col.names = c("Term", "Estimate", "Std. Error", "t value", "p-value"),
+      caption = "Table 1. Final model fit on the inference half of the training set.")
+```
+
+## Model diagnostics (inference half)
+
+```{r}
+# residuals vs fitted values: look for patterns or changing spread
+plot(final.model$fitted.values, final.model$residuals,
+     xlab = "Fitted values", ylab = "Residuals")
+abline(h = 0)
+
+# normality of residuals: histogram, normal Q-Q plot, and Shapiro-Wilk test
+hist(final.model$residuals, breaks = 30, main = "Residuals", xlab = "Residual")
+qqnorm(final.model$residuals)
+qqline(final.model$residuals)
+shapiro.test(final.model$residuals)
+
+# outliers: standardized residuals beyond +/- 3
+std.res <- rstandard(final.model)
+sum(abs(std.res) > 3)
+
+# influential points: Cook's distance vs the 50th percentile of F(k+1, n-(k+1))
+cooks <- cooks.distance(final.model)
+k <- length(coef(final.model)) - 1
+n <- nrow(infer.data)
+cutoff <- qf(0.5, k + 1, n - (k + 1))
+c(max_cooks = max(cooks), cutoff = cutoff, number_influential = sum(cooks > cutoff))
+```
+
+```{r}
+#| fig-cap: "Figure 2. Residuals versus fitted values for the final model (inference half of the training set)."
+diag.data <- data.frame(fitted = final.model$fitted.values, resid = final.model$residuals)
+fig2 <- ggplot(diag.data, aes(x = fitted, y = resid)) +
+  geom_point(alpha = 0.4) +
+  geom_hline(yintercept = 0, color = "red") +
+  labs(x = "Fitted Career Win Percentage", y = "Residual") +
+  theme_bw()
+fig2
+ggsave("figure2_residuals.pdf", fig2, width = 6, height = 4)
+```
+
+```{r}
+#| fig-cap: "Figure 3. Normal Q-Q plot of the final model's residuals."
+fig3 <- ggplot(diag.data, aes(sample = resid)) +
+  stat_qq(alpha = 0.4) +
+  stat_qq_line(color = "red") +
+  labs(x = "Theoretical Quantiles", y = "Sample Quantiles") +
+  theme_bw()
+fig3
+ggsave("figure3_qq.pdf", fig3, width = 6, height = 4)
+```
+
+## Predictive performance (test set)
+
+This is the only time the test set is used.
+
+```{r}
+test.pred <- predict(final.model, newdata = test)
+
+# root mean squared error on the test set
+test.rmse <- sqrt(mean((test$win_pct - test.pred)^2))
+
+# R^2 on the test set: 1 - SSE / SST
+test.r2 <- 1 - sum((test$win_pct - test.pred)^2) / sum((test$win_pct - mean(test$win_pct))^2)
+
+# baseline: predict every test athlete with the training-set average
+baseline.rmse <- sqrt(mean((test$win_pct - mean(train$win_pct))^2))
+
+# RMSE on the data the model was fit to, for comparison
+infer.rmse <- sqrt(mean(final.model$residuals^2))
+
+round(c(test_rmse = test.rmse, test_r2 = test.r2, baseline_rmse = baseline.rmse,
+        inference_rmse = infer.rmse), 3)
+```
+
+```{r}
+#| fig-cap: "Figure 4. Predicted versus actual career win percentage for athletes in the test set. The dashed line marks perfect prediction."
+pred.data <- data.frame(actual = test$win_pct, predicted = test.pred)
+fig4 <- ggplot(pred.data, aes(x = actual, y = predicted)) +
+  geom_point(alpha = 0.5) +
+  geom_abline(intercept = 0, slope = 1, linetype = "dashed", color = "red") +
+  labs(x = "Actual Career Win Percentage", y = "Predicted Career Win Percentage") +
+  theme_bw()
+fig4
+ggsave("figure4_test_predictions.pdf", fig4, width = 6, height = 4)
+```
